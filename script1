@@ -1,0 +1,564 @@
+/* JavaScript code to be implemented in Google Earth Engine(c) to accompany the paper: 
+
+Iban Berganzo-Besga, Hector A. Orengo, Felipe Lumbreras, Miguel Carerro-Pazos, João Fonte and Benito Vilas-Estévez
+Hybrid MSRM-based deep learning and multitemporal Sentinel 2-based machine learning algorithm detects near 10k archaeological tumuli in North-western Iberia
+Submitted to Remote Sensing
+
+
+                ------------- ooo -------------
+
+TO EXECUTE THE ALGORITHM PASTE THIS CODE INTO GOOGLE EARTH ENGINE CODE EDITOR AND PRESS 'Run'
+
+                ------------- ooo -------------
+
+For more information on how this code works and how to apply it refer to the text of the article and the supplementary material.
+This code is composed of two different algortihms (and the final multiplication of their resulting rasters). These are:
+A modified multitemporal image classification: For detailed information about this algorithm see Orengo et al. 2020. Automated detection of archaeological mounds using machine-learning classification of multisensor and multitemporal satellite data. PNAS, 117(31): 18240–18250
+Multi-Scale Relief Model (MSRM): For detailed information about this algorithm see Orengo and Petrie 2018. Multi-scale relief model (MSRM): a new algorithm for the visualization of subtle topographic change of variable size in digital elevation models. Earth Surface Processes and Landforms, 43(6): 1361–1369
+
+
+NOTES, READ CAREFULLY!
+1. To apply these analyses to your own areas: 
+    1.  Define a central point in your study area (as X,Y WGS84 decimal degrees) and a scale
+        for visualisation purposes in line 62.
+    2.  Eliminate the polygon variable in lines 54-8 and draw your own polygon (as a geometry)
+        delimiting your own Area of Interest (AOI) for the random forest classification using the
+        Geometry Imports menu in the top right corner of the map area below. If it is the same area
+        of the MDT simply write 'geometry' after '='
+    3.  Delete the 'classYes' and 'classNo' variables in the 'Machine learning' section and create 
+        two new polygon feature collections with the same names using the polygon drawing tool
+        in the top left map area. Remember to: a) make sure the new polygon layers are feature
+        collections; b) add property called 'class' with a value of one for the 'classYes' layer
+        and a value of 0 for the 'classNo' layer; c) draw polygons delimiting areas appropriate
+        for the presence of tumuli that you will use
+        as training data for the 'classYes' layer and any other type of landcover present (such as
+        rock outcrop, urban, water, etc.) for the 'classNo' layer. After obtaining the results
+        of the classification use these results to select more training polygons to improve the
+        results in the next iterations of the algorithm if necessary.
+3. For the MSRM the minimum and maximum feature size and the scaling factor are selected according
+   to needs of our paper, these should be changed, if necessary, to adapt to your own needs.
+4. The images resulting from this script can be transferred to your Assets or Google Drive running
+   the analysis from the 'Tasks' tab on the top right of the screen and selecting the Drive option.
+5. Specific instructions of how the algorithm works have been included within the code, please,
+   read these carefully and consult the paper's text to understand how to best apply it.
+
+
+                ------------- ooo ------------- */
+
+
+// Provide the address of the DTM
+var DTM = ee.Image('users/hao23/NW_Peninsula/MDT_Galicia1_1m'); // Use your own DTM here! You can upload it using the Assets tab in the top left corner
+
+var geometry = DTM.geometry();
+
+var geometryRF = ee.Geometry.Polygon( // This is the geometry of the whole of the study area instead of the relatively small MDT we have selected here. This area is included because the training polygons for the RF classification include areas that are not within the MDT. In normal circumstances where the training areas of the RF are within the area dfined by the MDT, instead of defining the polygon for the RF, this variable can equal the geometry of the MDT
+        [[[-9.305704841751872, 43.79209101307503],
+          [-9.305704841751872, 41.805283394536666],
+          [-6.729410896439371, 41.805283394536666],
+          [-6.729410896439371, 43.79209101307503]]], null, false);
+
+// Define a central point in your study area (as X,Y WGS84 decimal degrees) and a scale,
+// just for visualisation purposes. Change the coordinates to center the map in your own area
+Map.setCenter(-7.8405, 42.0951, 12);
+
+
+//////////////////////// RANDOM FOREST CLASSIFICATION /////////////////////////////
+
+//////////////////////// IMPORT & COMPOSITE SENTINEL 2 COLLECTION ////////////////////////
+
+// Function to mask clouds using the Sentinel-2 QA band.
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(
+             qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  // Return the masked and scaled data, without the QA bands.
+  return image.updateMask(mask).divide(10000)
+      .select("B.*")
+      .copyProperties(image, ["system:time_start"]);
+}
+
+// Map the function over one year of data and take the median.
+// Load Sentinel-2 TOA reflectance data.
+var S2_col = ee.ImageCollection('COPERNICUS/S2')
+    .filterBounds(geometryRF)
+    .filterDate('2015-06-23', '2020-06-05')
+    // Pre-filter to get less cloudy granules.
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .map(maskS2clouds);
+
+// Print total Sentinel 2 images employed
+print('Sentinel 2 images employed:', S2_col);
+
+// Select the bands of interest form the Image Collection
+var Composite = S2_col.select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12'])
+  .mean().clip(geometryRF);
+    
+print('Composite Sentinel 2 image:', Composite);
+
+
+// ////////////////////// MACHINE LEARNING RF CLASSIFIER ////////////////////////
+
+/* Call training data for current iteration. The user wanting to generate her/his own training 
+data is prompted to use the geometry imports panel in the map view below to create new feature 
+collections (named 'calssYes' and 'classNo' if the user wants to reuse the code below) with a property 
+named 'class' and a value of 1 and 0 respectively. These will be used to identify areas where
+tumuli can be found all other types of landcover that are not appropiate for the location of mounds */
+
+// Training polygons
+var classYes = ee.FeatureCollection(
+        [ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-8.549489655712089, 42.87856869974629],
+                  [-8.549500384548148, 42.878183457412135],
+                  [-8.549178519466361, 42.87819131952463],
+                  [-8.5492214348106, 42.87864732033531]]]),
+            {
+              "class": 1,
+              "system:index": "0"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.752591089407865, 42.06950613312582],
+                  [-7.751539663474027, 42.06794509854455],
+                  [-7.749415353934232, 42.0687574784742],
+                  [-7.75121779839224, 42.070159207632564]]]),
+            {
+              "class": 1,
+              "system:index": "1"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.818959669272367, 42.069966197935656],
+                  [-7.818058447043363, 42.06815031008107],
+                  [-7.816534952322904, 42.06910604700601],
+                  [-7.817929701010648, 42.07012548386579]]]),
+            {
+              "class": 1,
+              "system:index": "2"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.825783209006254, 42.06833349410635],
+                  [-7.825418428580228, 42.06735385165186],
+                  [-7.824753240744535, 42.06773615294492],
+                  [-7.825429157416288, 42.06834942312704]]]),
+            {
+              "class": 1,
+              "system:index": "3"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.166296544842045, 43.40149486136451],
+                  [-7.167111936382573, 43.39984227588822],
+                  [-7.165652814678471, 43.39953046225296],
+                  [-7.165051999859135, 43.40130777847887]]]),
+            {
+              "class": 1,
+              "system:index": "4"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.685959403759144, 43.202225460208155],
+                  [-7.685959403759144, 43.20164672569119],
+                  [-7.684028213268421, 43.2017718579438],
+                  [-7.68404967094054, 43.20228802577305]]]),
+            {
+              "class": 1,
+              "system:index": "5"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.696366374736927, 43.200958493714175],
+                  [-7.6967311551629525, 43.20053616570279],
+                  [-7.695829932933949, 43.20022332825403],
+                  [-7.695186202770374, 43.200802076273035]]]),
+            {
+              "class": 1,
+              "system:index": "6"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-8.884747424973, 42.669862617014175],
+                  [-8.88376037205552, 42.670083497539245],
+                  [-8.88350287999009, 42.670683026436336],
+                  [-8.884876171005715, 42.67039903978489]]]),
+            {
+              "class": 1,
+              "system:index": "7"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-8.915898600471962, 42.66604441531614],
+                  [-8.91618827904557, 42.66583140955447],
+                  [-8.915984431160439, 42.66572096183514],
+                  [-8.915646472824562, 42.665949746178825]]]),
+            {
+              "class": 1,
+              "system:index": "8"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.303844464700708, 42.64721900463746],
+                  [-7.304509652536401, 42.64800814737226],
+                  [-7.304810059946069, 42.6478503196262],
+                  [-7.3040053972416015, 42.64714008981335]]]),
+            {
+              "class": 1,
+              "system:index": "9"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.499262964476481, 43.22908624888055],
+                  [-7.496194517363444, 43.22999304377327],
+                  [-7.496301805724039, 43.23039953365622],
+                  [-7.4996706602467444, 43.229617819936664]]]),
+            {
+              "class": 1,
+              "system:index": "10"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.754117571181928, 42.067456533537836],
+                  [-7.754503809280073, 42.065895448555416],
+                  [-7.750813089675581, 42.06468478479413],
+                  [-7.750426851577436, 42.065513136177536]]]),
+            {
+              "class": 1,
+              "system:index": "11"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.728035770721113, 42.054946863384025],
+                  [-7.728057228393232, 42.054683978548354],
+                  [-7.727799736327802, 42.05450872138669],
+                  [-7.727563701934492, 42.05465211364583],
+                  [-7.727552973098432, 42.05493093100073]]]),
+            {
+              "class": 1,
+              "system:index": "12"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.832785015869139, 43.28310934462581],
+                  [-7.8303817565917955, 43.283296792098554],
+                  [-7.830338841247557, 43.28367168531134],
+                  [-7.832742100524901, 43.283702926308166]]]),
+            {
+              "class": 1,
+              "system:index": "13"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.865195657892514, 42.03409494439438],
+                  [-7.865710642023373, 42.033537125554965],
+                  [-7.865388776941586, 42.03325024538838],
+                  [-7.864659216089535, 42.03379212906046]]]),
+            {
+              "class": 1,
+              "system:index": "14"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.866959324434763, 41.95533606613339],
+                  [-7.866983464315897, 41.955044843909455],
+                  [-7.866725972250467, 41.95501691842081],
+                  [-7.866755476549631, 41.95534005546967]]]),
+            {
+              "class": 1,
+              "system:index": "15"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-8.909014573283711, 43.1300616462209],
+                  [-8.908964952416936, 43.12992755828231],
+                  [-8.90853714007906, 43.129903089648685],
+                  [-8.908507635779896, 43.130032283923725]]]),
+            {
+              "class": 1,
+              "system:index": "16"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-9.044919080364211, 43.07859407681435],
+                  [-9.044913715946182, 43.07847652875752],
+                  [-9.04472059689711, 43.07846477393943],
+                  [-9.044707185852035, 43.0785666489546]]]),
+            {
+              "class": 1,
+              "system:index": "17"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-9.019834775268043, 43.07494272154274],
+                  [-9.019824046431983, 43.07479577768073],
+                  [-9.019502181350196, 43.074724264873765],
+                  [-9.019401598512138, 43.074820268348866],
+                  [-9.019502181350196, 43.07494174191815]]]),
+            {
+              "class": 1,
+              "system:index": "18"
+            })]),
+    classNo = ee.FeatureCollection(
+        [ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-8.546785989025077, 42.87854118251647],
+                  [-8.546732344844779, 42.87826600954336],
+                  [-8.546340742328605, 42.87830532004325],
+                  [-8.546394386508902, 42.878604079023766]]]),
+            {
+              "class": 0,
+              "system:index": "0"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-9.229393699080966, 42.94141345159453],
+                  [-9.229629733474276, 42.9408479572715],
+                  [-9.228674867064974, 42.94052593734993],
+                  [-9.228889443786166, 42.94111499690461]]]),
+            {
+              "class": 0,
+              "system:index": "1"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-9.223984362043607, 42.94165922146044],
+                  [-9.224220396436918, 42.941553192093735],
+                  [-9.22418820992874, 42.94147465170441],
+                  [-9.223855616010892, 42.94159246225084]]]),
+            {
+              "class": 0,
+              "system:index": "2"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-9.112608864904388, 42.86651599002795],
+                  [-9.112737608620584, 42.86616999611614],
+                  [-9.112104616868198, 42.866138541534006],
+                  [-9.112083161512718, 42.866358718631126]]]),
+            {
+              "class": 0,
+              "system:index": "3"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.567205864609432, 43.045357474582275],
+                  [-7.564523655594539, 43.044149982723376],
+                  [-7.564330536545467, 43.04435384665287],
+                  [-7.566841084183406, 43.045718149358734]]]),
+            {
+              "class": 0,
+              "system:index": "4"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.586534024783811, 43.09053824052823],
+                  [-7.585986854144773, 43.08993494241495],
+                  [-7.585686446735105, 43.09017782938297],
+                  [-7.586222888538083, 43.09071061032628]]]),
+            {
+              "class": 0,
+              "system:index": "5"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-8.470356502899035, 43.31229034696851],
+                  [-8.4712148097838, 43.31217324821455],
+                  [-8.471204080947741, 43.31192343678537],
+                  [-8.470109739669665, 43.31205614923497]]]),
+            {
+              "class": 0,
+              "system:index": "6"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.772611097495023, 42.07660994847324],
+                  [-7.768233732382718, 42.07966784838223],
+                  [-7.7684053937596715, 42.08110118824062],
+                  [-7.773555235068265, 42.07982710996537]]]),
+            {
+              "class": 0,
+              "system:index": "7"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-8.917904892815102, 42.667598546376254],
+                  [-8.917872706306923, 42.667511768508774],
+                  [-8.917754689110268, 42.667468379529595],
+                  [-8.917631307495583, 42.66742893497682],
+                  [-8.917545476807106, 42.667495990701674],
+                  [-8.917642036331642, 42.66764193526455],
+                  [-8.917829790962685, 42.667606435267295]]]),
+            {
+              "class": 0,
+              "system:index": "8"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.859467438991101, 41.95281290449971],
+                  [-7.859549246366055, 41.95274009618624],
+                  [-7.859566680724652, 41.95265731403014],
+                  [-7.859525106484921, 41.95262041110666],
+                  [-7.859411112601788, 41.95269521430774],
+                  [-7.859278343255551, 41.95279096227702],
+                  [-7.85929443650964, 41.95282387560823]]]),
+            {
+              "class": 0,
+              "system:index": "9"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-7.847238738779294, 41.95052266461638],
+                  [-7.8472172811071745, 41.950550592074144],
+                  [-7.847162295822369, 41.950550592074144],
+                  [-7.847155590299832, 41.950591485829484],
+                  [-7.84719850564407, 41.95064135622734],
+                  [-7.847257514242398, 41.950630384743164],
+                  [-7.847308476213681, 41.950567548024644],
+                  [-7.847250808719861, 41.950504711244236]]]),
+            {
+              "class": 0,
+              "system:index": "10"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-8.242115968880576, 42.95687246336122],
+                  [-8.242343956646842, 42.956947058070426],
+                  [-8.24239760082714, 42.956887186008366],
+                  [-8.242184365210456, 42.95678609042705]]]),
+            {
+              "class": 0,
+              "system:index": "11"
+            }),
+        ee.Feature(
+            ee.Geometry.Polygon(
+                [[[-8.279540575382518, 42.98434480593723],
+                  [-8.279525823232936, 42.98426043372017],
+                  [-8.279454744694041, 42.9842643580119],
+                  [-8.279450721380519, 42.98428888482955],
+                  [-8.279289788839625, 42.98429967662624],
+                  [-8.27928174221258, 42.98434774915201],
+                  [-8.279300517675685, 42.98439680271101],
+                  [-8.279615677234935, 42.9843771812921],
+                  [-8.279606289503382, 42.984339900578945]]]),
+            {
+              "class": 0,
+              "system:index": "12"
+            })]);
+
+// Merge training data
+var trn_pnts = classYes.merge(classNo);
+print('Training polygons:',trn_pnts);
+
+// Create variable for bands
+var bands = ['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12']; 
+
+// Sample Regions to extract band values for each pixel in each training polygon
+var training = Composite.select(bands).sampleRegions({
+  collection: trn_pnts,
+  properties: ['class'],
+  scale: 10
+}); 
+
+// Apply RF classifier
+var classifier = ee.Classifier.smileRandomForest({'numberOfTrees':128}).train({
+  features: training,
+  classProperty: 'class',
+  inputProperties: bands
+});
+
+// Create classified probability raster
+var classified = Composite.select(bands).classify(classifier);
+
+// Add the resulting classified layer to the Map Window below
+Map.addLayer(classified, {min: 0, max: 1}, 'classified'); // It can take several minutes to load
+
+
+///////////////////////// MSRM ////////////////////////
+
+var fmax = 19; //the maximum size of the feature you want to detect in meters
+var fminPrmpt = 1; //the minimum size of the feature you want to detect in meters
+var x = 2; //the scaling factor do you want to use
+
+//The following line of code will extract the raster resolution (rr).
+
+var rr = Math.round((DTM.projection().nominalScale().getInfo())*1000) / 1000;
+
+
+// The following lines of code will make sure that a minimum feature size is selected that can be computed by the algorithm
+if (fminPrmpt <= rr) {
+  var fmin = rr;
+} else {
+  var fmin = fminPrmpt;
+}
+
+print('MSRM properties:',
+  'Maximun feature size',fmax,
+  'Minimun feature size',fmin,
+  'Raster resolution',rr,
+  'Scaling factor',x);
+
+var i = Math.floor(Math.pow((fmin-rr)/(2*rr),1/x));
+
+var n = Math.ceil(Math.pow((fmax-rr)/(2*rr),1/x));
+print('Value for i:', i, 'Value for n: ', n, 'Number of relief surfaces to be employed', n-i);
+
+var arrayLP = [];
+
+var LPrs = '';
+
+for (var ndx = i; ndx <= n; ndx++) {
+  var boxcar = ee.Kernel.square({
+  radius: Math.pow(ndx,x), units: 'pixels', normalize: true});
+  var LP = DTM.convolve(boxcar);
+  LPrs = LPrs + '' + Math.pow(ndx,x) + ',';
+  arrayLP.push(LP);
+}
+
+print('Low Pass filter radii to be employed', LPrs);
+
+var compLP = ee.Image([arrayLP]);
+
+var arrayRM = [];
+
+for (var ndx2 = 0; ndx2 < n-i; ndx2++) {
+  var RM = compLP.expression('((b1 - b2))', {
+      'b1': compLP.select(ndx2),
+      'b2': compLP.select(ndx2+1)
+  });
+  arrayRM.push(RM);
+}
+
+var MSRMraw = ee.Image([arrayRM])
+.reduce(ee.Reducer.mean());
+
+var MSRM = ee.Image(0).expression(
+    'round(img * 1000) / 1000', {
+      'img': MSRMraw
+    });
+    
+Map.addLayer(MSRM, {palette: "000000,2207ff,00fff3,03ff00,fbff00,ffc800,ff0000,e300ff,ffffff"}, 'MSRM');
+
+
+///////////////////////// MULTIPLICATION OF OUTPUTS FROM MSRM AND RF CLASSIFICATION ////////////////////////
+
+var result = MSRM.multiply(classified);
+Map.addLayer(result, {palette: "000000,2207ff,00fff3,03ff00,fbff00,ffc800,ff0000,e300ff,ffffff"}, 'result');
+
+
+///////////////////////// EXPORT OF RESULTING DATASETS ////////////////////////
+
+// Data exports to Google Drive but they can also be exported as an asset to be used within GEE
+Export.image.toDrive({
+  image: result,
+  description: 'result',
+  scale: 10,
+  maxPixels: 1e12,
+  region: geometry
+});
