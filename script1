@@ -558,7 +558,7 @@ Map.addLayer(result, {palette: "000000,2207ff,00fff3,03ff00,fbff00,ffc800,ff0000
 Export.image.toDrive({
   image: result,
   description: 'result',
-  scale: 1,
+  scale: DTM,
   maxPixels: 1e12,
   region: geometry
 });
